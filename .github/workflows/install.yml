@@ -15,7 +15,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 1. فك ضغط كل الملفات
+      # ------------------------------------------------------------------
+      # 1. فك ضغط جميع الملفات (Tweak, deps, scripts, main) في سلة واحدة
+      # ------------------------------------------------------------------
       - name: 1) Unzip All Files
         shell: bash
         run: |
@@ -24,26 +26,28 @@ jobs:
           rm -rf _extract
           mkdir -p _extract
 
+          # البحث عن كل ملف zip وفك ضغطه
           find . -maxdepth 1 -name "*.zip" -exec unzip -o -q {} -d _extract \;
 
           echo "✅ Extracted files tree:"
           find _extract -maxdepth 2 -type d
 
-      # 2. تحديد مسار المشروع
+      # ------------------------------------------------------------------
+      # 2. تحديد مسار المشروع تلقائياً
+      # ------------------------------------------------------------------
       - name: 2) Locate Project Root
         shell: bash
         run: |
-          # نبحث عن أي ملف كود مصدري لتحديد المجلد الرئيسي بدلاً من الاعتماد على Makefile المكسور
-          # نبحث عن Tweak.mm أو Main.cpp
+          # نبحث عن أي ملف كود أساسي (مثل Tweak.xm أو Dumper.cpp)
           SRC_FILE=$(find _extract -name "Tweak.mm" -o -name "Tweak.xm" -o -name "Dumper.cpp" | head -n 1)
 
           if [ -z "$SRC_FILE" ]; then
-            echo "❌ Error: No source code found!"
+            echo "❌ Error: No source code found in zips!"
             exit 1
           fi
 
           PROJECT_ROOT=$(dirname "$SRC_FILE")
-          # إذا كان الملف داخل src، نعود خطوة للوراء
+          # تصحيح المسار إذا كان داخل مجلد src
           if [[ $(basename "$PROJECT_ROOT") == "src" ]]; then
             PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
           fi
@@ -51,35 +55,45 @@ jobs:
           echo "✅ Project Root: $PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
 
-      # 3. إصلاح KittyMemory
+      # ------------------------------------------------------------------
+      # 3. إصلاح مكان KittyMemory (نقلها لداخل deps)
+      # ------------------------------------------------------------------
       - name: 3) Fix KittyMemory
         shell: bash
         run: |
           cd "$PROJECT_ROOT"
           mkdir -p deps
 
+          # البحث عن الملف الرئيسي للمكتبة
           KITTY_FILE=$(find ../.. -name "KittyInclude.hpp" | head -n 1)
 
           if [ -n "$KITTY_FILE" ]; then
             echo "✅ Found KittyInclude at: $KITTY_FILE"
             KITTY_DIR=$(dirname "$KITTY_FILE")
+            
+            # التأكد من نسخ المجلد الصحيح
             if [[ $(basename "$KITTY_DIR") == "KittyMemory" ]]; then
                CP_SOURCE="$KITTY_DIR"
             else
                CP_SOURCE="$KITTY_DIR"
             fi
+            
+            # تنظيف ونسخ
             rm -rf deps/KittyMemory
             mkdir -p deps/KittyMemory
             cp -R "$CP_SOURCE/" deps/KittyMemory/
+            
             echo "KITTY_PATH=$PROJECT_ROOT/deps/KittyMemory" >> $GITHUB_ENV
           else
-            echo "⚠️ Not found, cloning from git..."
+            echo "⚠️ KittyMemory not found, cloning from git..."
             rm -rf deps/KittyMemory
             git clone --depth=1 https://github.com/MJx0/KittyMemory.git deps/KittyMemory
             echo "KITTY_PATH=$PROJECT_ROOT/deps/KittyMemory" >> $GITHUB_ENV
           fi
 
-      # 4. إنشاء Makefile جديد (الحل السحري)
+      # ------------------------------------------------------------------
+      # 4. إنشاء Makefile جديد (الحل السحري للملفات المفقودة)
+      # ------------------------------------------------------------------
       - name: 4) Generate Fresh Makefile
         shell: bash
         run: |
@@ -89,8 +103,8 @@ jobs:
           rm -f Makefile
 
           echo "🆕 Generating smart Makefile..."
-          # نكتب ملف جديد يستخدم wildcard للبحث عن الملفات الموجودة فقط
-          # هذا يمنع خطأ "File not found" نهائياً
+          # هذا الملف الجديد يستخدم wildcard ليجمع الملفات الموجودة فقط
+          # ويتجاهل أي ملف مفقود (مثل Alert.mm) فلا يتوقف البناء
           
           cat <<'EOF' > Makefile
           TARGET := iphone:clang:latest:14.0
@@ -101,7 +115,7 @@ jobs:
 
           TWEAK_NAME = UEDumper
 
-          # البحث عن كل ملفات الكود تلقائياً (سواء في الجذر أو في src)
+          # جمع كل ملفات الكود الموجودة في المجلدات تلقائياً
           UEDumper_FILES = $(wildcard *.xm) $(wildcard *.mm) \
                            $(wildcard src/*.cpp) $(wildcard src/*.mm) \
                            $(wildcard src/*/*.cpp) $(wildcard src/*/*.mm) \
@@ -110,16 +124,18 @@ jobs:
 
           UEDumper_FRAMEWORKS = UIKit Foundation Security
 
+          # إعدادات المترجم
           UEDumper_CFLAGS = -fobjc-arc -Wno-error -Wno-deprecated-declarations -Wno-unused-variable
           UEDumper_CCFLAGS = -std=c++17 -I. -Ideps/KittyMemory -Isrc
 
           include $(THEOS_MAKE_PATH)/tweak.mk
           EOF
           
-          echo "✅ Makefile created:"
-          cat Makefile
+          echo "✅ New Makefile created successfully."
 
-      # 5. تنصيب Theos
+      # ------------------------------------------------------------------
+      # 5. تنصيب Theos (مع حل مشكلة SDK)
+      # ------------------------------------------------------------------
       - name: 5) Setup Theos Clean
         shell: bash
         run: |
@@ -128,13 +144,18 @@ jobs:
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "$HOME/theos/bin" >> $GITHUB_PATH
 
+          # حذف مجلد SDKs الفارغ لتجنب الخطأ
           rm -rf $HOME/theos/sdks
           git clone --depth=1 https://github.com/theos/sdks.git $HOME/theos/sdks
+          
+          # حذف الإصدارات القديمة لتسريع العملية
           rm -rf $HOME/theos/sdks/iPhoneOS{9..13}.sdk
           
           brew install ldid xz
 
-      # 6. البناء
+      # ------------------------------------------------------------------
+      # 6. البناء النهائي
+      # ------------------------------------------------------------------
       - name: 6) Build Package
         shell: bash
         run: |
@@ -145,9 +166,9 @@ jobs:
           
           make package FINALPACKAGE=1 messages=yes \
             THEOS_PACKAGE_SCHEME=rootless
-            
+
       - name: Upload DEB
         uses: actions/upload-artifact@v4
         with:
-          name: UEDumper_Fixed_DEB
+          name: UEDumper_Final_DEB
           path: ${{ env.PROJECT_ROOT }}/packages/*.deb
