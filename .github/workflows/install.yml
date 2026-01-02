@@ -1,4 +1,4 @@
-name: Final Fix (Mac Sed + SDK + Paths)
+name: Ultimate Build (Auto-Gen Makefile)
 
 on:
   push:
@@ -33,14 +33,21 @@ jobs:
       - name: 2) Locate Project Root
         shell: bash
         run: |
-          MAKEFILE_PATH=$(find _extract -name "Makefile" | head -n 1)
+          # نبحث عن أي ملف كود مصدري لتحديد المجلد الرئيسي بدلاً من الاعتماد على Makefile المكسور
+          # نبحث عن Tweak.mm أو Main.cpp
+          SRC_FILE=$(find _extract -name "Tweak.mm" -o -name "Tweak.xm" -o -name "Dumper.cpp" | head -n 1)
 
-          if [ -z "$MAKEFILE_PATH" ]; then
-            echo "❌ Error: Makefile not found!"
+          if [ -z "$SRC_FILE" ]; then
+            echo "❌ Error: No source code found!"
             exit 1
           fi
 
-          PROJECT_ROOT=$(dirname "$MAKEFILE_PATH")
+          PROJECT_ROOT=$(dirname "$SRC_FILE")
+          # إذا كان الملف داخل src، نعود خطوة للوراء
+          if [[ $(basename "$PROJECT_ROOT") == "src" ]]; then
+            PROJECT_ROOT=$(dirname "$PROJECT_ROOT")
+          fi
+
           echo "✅ Project Root: $PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
 
@@ -51,25 +58,19 @@ jobs:
           cd "$PROJECT_ROOT"
           mkdir -p deps
 
-          # البحث عن الهيدر في الملفات المفكوكة
           KITTY_FILE=$(find ../.. -name "KittyInclude.hpp" | head -n 1)
 
           if [ -n "$KITTY_FILE" ]; then
             echo "✅ Found KittyInclude at: $KITTY_FILE"
             KITTY_DIR=$(dirname "$KITTY_FILE")
-            
-            # حالة خاصة: إذا كان الملف داخل مجلد فرعي اسمه KittyMemory
             if [[ $(basename "$KITTY_DIR") == "KittyMemory" ]]; then
-               # ننسخ المجلد الأب للحفاظ على الهيكلية
                CP_SOURCE="$KITTY_DIR"
             else
                CP_SOURCE="$KITTY_DIR"
             fi
-            
             rm -rf deps/KittyMemory
             mkdir -p deps/KittyMemory
             cp -R "$CP_SOURCE/" deps/KittyMemory/
-            
             echo "KITTY_PATH=$PROJECT_ROOT/deps/KittyMemory" >> $GITHUB_ENV
           else
             echo "⚠️ Not found, cloning from git..."
@@ -78,44 +79,55 @@ jobs:
             echo "KITTY_PATH=$PROJECT_ROOT/deps/KittyMemory" >> $GITHUB_ENV
           fi
 
-      # 4. إصلاح Makefile (تم تصحيح أمر sed للماك)
-      - name: 4) Fix Makefile Source
+      # 4. إنشاء Makefile جديد (الحل السحري)
+      - name: 4) Generate Fresh Makefile
         shell: bash
         run: |
           cd "$PROJECT_ROOT"
           
-          # إذا كان Makefile يطلب UEDumper.mm وهو غير موجود
-          if grep -q "UEDumper.mm" Makefile && [ ! -f "UEDumper.mm" ]; then
-            echo "⚠️ UEDumper.mm referenced but missing!"
-            
-            # البحث عن الملف البديل (Tweak.mm أو src/Tweak.mm)
-            ALT_FILE=$(find . -name "Tweak.mm" -o -name "Tweak.xm" | head -n 1 | sed 's|^\./||')
-            
-            if [ -n "$ALT_FILE" ]; then
-              echo "🔧 Patching Makefile: Replacing UEDumper.mm with $ALT_FILE"
-              
-              # --- التصحيح هنا: استخدام -i '' للتوافق مع macOS ---
-              sed -i '' "s|UEDumper.mm|$ALT_FILE|g" Makefile
-              
-              echo "✅ Makefile patched successfully."
-              grep "_FILES" Makefile
-            else
-              echo "❌ Critical: No source file found!"
-              exit 1
-            fi
-          fi
+          echo "🗑️ Deleting old broken Makefile..."
+          rm -f Makefile
 
-      # 5. تنصيب Theos (مع تنظيف SDK)
+          echo "🆕 Generating smart Makefile..."
+          # نكتب ملف جديد يستخدم wildcard للبحث عن الملفات الموجودة فقط
+          # هذا يمنع خطأ "File not found" نهائياً
+          
+          cat <<'EOF' > Makefile
+          TARGET := iphone:clang:latest:14.0
+          ARCHS = arm64 arm64e
+          THEOS_PACKAGE_SCHEME = rootless
+
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = UEDumper
+
+          # البحث عن كل ملفات الكود تلقائياً (سواء في الجذر أو في src)
+          UEDumper_FILES = $(wildcard *.xm) $(wildcard *.mm) \
+                           $(wildcard src/*.cpp) $(wildcard src/*.mm) \
+                           $(wildcard src/*/*.cpp) $(wildcard src/*/*.mm) \
+                           $(wildcard src/*/*/*.cpp) $(wildcard src/*/*/*.mm) \
+                           $(wildcard deps/KittyMemory/*.cpp)
+
+          UEDumper_FRAMEWORKS = UIKit Foundation Security
+
+          UEDumper_CFLAGS = -fobjc-arc -Wno-error -Wno-deprecated-declarations -Wno-unused-variable
+          UEDumper_CCFLAGS = -std=c++17 -I. -Ideps/KittyMemory -Isrc
+
+          include $(THEOS_MAKE_PATH)/tweak.mk
+          EOF
+          
+          echo "✅ Makefile created:"
+          cat Makefile
+
+      # 5. تنصيب Theos
       - name: 5) Setup Theos Clean
         shell: bash
         run: |
           rm -rf $HOME/theos
           git clone --recursive --depth=1 https://github.com/theos/theos.git $HOME/theos
-          
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "$HOME/theos/bin" >> $GITHUB_PATH
 
-          # حذف SDKs المسبقة لتجنب الخطأ
           rm -rf $HOME/theos/sdks
           git clone --depth=1 https://github.com/theos/sdks.git $HOME/theos/sdks
           rm -rf $HOME/theos/sdks/iPhoneOS{9..13}.sdk
@@ -131,12 +143,9 @@ jobs:
           echo "🚀 Building..."
           make clean || true
           
-          # إضافة مسارات التضمين لحل مشكلة 'file not found'
           make package FINALPACKAGE=1 messages=yes \
-            THEOS_PACKAGE_SCHEME=rootless \
-            ADDITIONAL_CFLAGS="-I$KITTY_PATH -I$PROJECT_ROOT/deps" \
-            ADDITIONAL_CCFLAGS="-I$KITTY_PATH -I$PROJECT_ROOT/deps"
-
+            THEOS_PACKAGE_SCHEME=rootless
+            
       - name: Upload DEB
         uses: actions/upload-artifact@v4
         with:
