@@ -1,0 +1,64 @@
+name: Build Fixed
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fix & Unzip Everything
+        run: |
+          # 1. فك ضغط كل الملفات الموجودة
+          echo "Unzipping all files..."
+          for file in *.zip; do
+            if [ -f "$file" ]; then
+              unzip -o "$file"
+            fi
+          done
+
+          # 2. البحث عن ملف Makefile
+          echo "Locating project..."
+          MAKEFILE_PATH=$(find . -name "Makefile" -not -path "*/theos/*" | head -n 1)
+          
+          if [ -z "$MAKEFILE_PATH" ]; then
+            echo "❌ Error: Could not find Makefile inside zip files!"
+            exit 1
+          fi
+          
+          PROJECT_ROOT=$(dirname "$MAKEFILE_PATH")
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
+          
+          # 3. نقل مجلد deps إذا كان منفصلاً (إصلاح مشكلة KittyMemory)
+          if [ -d "deps" ] && [ "$PROJECT_ROOT" != "." ] && [ ! -d "$PROJECT_ROOT/deps" ]; then
+            echo "Moving deps to project folder..."
+            mv deps "$PROJECT_ROOT/"
+          fi
+
+      - name: Setup Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+          git clone https://github.com/theos/sdks.git $HOME/theos/sdks
+          rm -rf $HOME/theos/sdks/*.sdk
+          brew install ldid xz
+
+      - name: Build Tweak
+        run: |
+          cd ${{ env.PROJECT_ROOT }}
+          make clean || true
+          # هذا الأمر يبني المشروع بدون جلبريك
+          make package FINALPACKAGE=1 messages=yes
+
+      - name: Upload Result
+        uses: actions/upload-artifact@v4
+        with:
+          name: UEDumper_Deb_File
+          path: ${{ env.PROJECT_ROOT }}/packages/*.deb
