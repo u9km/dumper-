@@ -1,14 +1,14 @@
-name: Auto-Build from ZIP (No-Jailbreak)
+name: Build All Zips (No-Jailbreak)
 
 on:
   push:
     paths:
-      - '**/*.zip'  # يعمل فقط عند رفع ملف مضغوط
-  workflow_dispatch: # يسمح لك بتشغيله يدوياً أيضاً
+      - '**/*.zip'
+  workflow_dispatch:
 
 jobs:
   build:
-    name: Extract & Build
+    name: Extract All & Build
     runs-on: macos-latest
 
     steps:
@@ -17,60 +17,41 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Find and Unzip Project
+      - name: Unzip ALL Files
         run: |
-          # البحث عن أول ملف zip في المستودع
-          ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
+          echo "Finding and unzipping all zip files..."
+          # هذا الأمر يفك ضغط كل الملفات الموجودة دفعة واحدة
+          # الترتيب مهم: سيفك ضغطهم في نفس المكان ليتعرفوا على بعض
+          for file in *.zip; do
+            echo "Unzipping $file..."
+            unzip -o "$file"
+          done
           
-          if [ -z "$ZIP_FILE" ]; then
-            echo "::error::No .zip file found! Please upload your project as a zip file."
-            exit 1
-          fi
-          
-          echo "Found zip file: $ZIP_FILE"
-          # فك الضغط في مجلد اسمه extracted_project
-          unzip -o "$ZIP_FILE" -d extracted_project
-          echo "Unzipped successfully."
+          echo "Files in directory after unzip:"
+          ls -R | grep ":$" | head -n 10 # طباعة للتأكد من الملفات
 
-      - name: Locate Project Root
+      - name: Locate Makefile
         id: locate
         run: |
-          # البحث عن مكان Makefile داخل المجلد المفكوك
-          MAKEFILE_PATH=$(find extracted_project -name "Makefile" | head -n 1)
+          # البحث عن ملف Makefile في أي مكان (سواء داخل مجلد Tweak أو في الجذر)
+          MAKEFILE_PATH=$(find . -name "Makefile" -not -path "*/theos/*" | head -n 1)
           
           if [ -z "$MAKEFILE_PATH" ]; then
-            echo "::error::Makefile not found inside the zip!"
+            echo "::error::Makefile not found! Make sure one of your zips contains the source code."
             exit 1
           fi
           
-          # تحديد مجلد العمل
           PROJECT_ROOT=$(dirname "$MAKEFILE_PATH")
           echo "Project root found at: $PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
 
-      - name: Setup Dependencies (KittyMemory)
+      - name: Fix Dependencies (Merge deps)
         run: |
-          cd ${{ env.PROJECT_ROOT }}
-          
-          # التحقق مما إذا كان UEDumper يحتاج KittyMemory ولم تكن موجودة في الـ Zip
-          # المرجع: ملف .gitmodules يشير إلى KittyMemory
-          if grep -q "KittyMemory" Makefile || [ -d "src" ]; then
-             echo "Checking for KittyMemory..."
-             # إنشاء مجلد deps إذا لم يكن موجوداً
-             mkdir -p deps
-             if [ ! -d "deps/KittyMemory" ]; then
-                 echo "Cloning KittyMemory..."
-                 git clone https://github.com/MJx0/KittyMemory.git deps/KittyMemory
-                 
-                 # إضافة مسار KittyMemory إلى Makefile ديناميكياً إذا لم يكن مضافاً
-                 if ! grep -q "deps/KittyMemory" Makefile; then
-                    echo "Injecting KittyMemory paths into Makefile..."
-                    # إضافة ملفات KittyMemory إلى قائمة الملفات
-                    sed -i '' 's|_FILES =|_FILES = deps/KittyMemory/*.cpp |' Makefile
-                    # إضافة مسار التضمين (Include Path)
-                    sed -i '' 's|_CCFLAGS =|_CCFLAGS = -Ideps/KittyMemory |' Makefile
-                 fi
-             fi
+          # هذه الخطوة ذكية: إذا كان مجلد deps مفصولاً، سنحاول وضعه في المكان الصحيح
+          # إذا وجدنا مجلد deps في الجذر، ومجلد المشروع في مكان آخر، ننقل deps للمشروع
+          if [ -d "deps" ] && [ "${{ env.PROJECT_ROOT }}" != "." ]; then
+             echo "Moving deps folder to project root..."
+             cp -r deps "${{ env.PROJECT_ROOT }}/"
           fi
 
       - name: Setup Theos
@@ -78,23 +59,19 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "$HOME/theos/bin" >> $GITHUB_PATH
-          
-          # تحميل SDKs
           git clone https://github.com/theos/sdks.git $HOME/theos/sdks
           rm -rf $HOME/theos/sdks/*.sdk
-          
-          # تنصيب أدوات الضغط والتوقيع
           brew install ldid xz
 
       - name: Build Package
         run: |
           cd ${{ env.PROJECT_ROOT }}
-          # بناء الحزمة النهائية (Final) بدون كراش وبدون ملفات debug
+          # تنظيف وبناء
+          make clean
           make package FINALPACKAGE=1 messages=yes
 
       - name: Upload DEB Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Tweak_Output
+          name: Final_Tweak
           path: ${{ env.PROJECT_ROOT }}/packages/*.deb
-
