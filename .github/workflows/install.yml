@@ -1,4 +1,4 @@
-name: Build Fixed (SDK + Makefile + Kitty)
+name: Final Fix (Mac Sed + SDK + Paths)
 
 on:
   push:
@@ -15,9 +15,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ------------------------------------------------------------------
-      # 1. فك ضغط جميع الملفات ودمجها في مجلد واحد
-      # ------------------------------------------------------------------
+      # 1. فك ضغط كل الملفات
       - name: 1) Unzip All Files
         shell: bash
         run: |
@@ -26,19 +24,15 @@ jobs:
           rm -rf _extract
           mkdir -p _extract
 
-          # فك ضغط كل ملف zip داخل المجلد _extract
           find . -maxdepth 1 -name "*.zip" -exec unzip -o -q {} -d _extract \;
 
-          echo "✅ Extracted files tree (Level 2):"
+          echo "✅ Extracted files tree:"
           find _extract -maxdepth 2 -type d
-          
-      # ------------------------------------------------------------------
-      # 2. تحديد مسار المشروع (Makefile)
-      # ------------------------------------------------------------------
+
+      # 2. تحديد مسار المشروع
       - name: 2) Locate Project Root
         shell: bash
         run: |
-          # البحث عن ملف Makefile
           MAKEFILE_PATH=$(find _extract -name "Makefile" | head -n 1)
 
           if [ -z "$MAKEFILE_PATH" ]; then
@@ -50,29 +44,32 @@ jobs:
           echo "✅ Project Root: $PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
 
-      # ------------------------------------------------------------------
-      # 3. إصلاح مشكلة KittyInclude.hpp (نقلها للمكان الصحيح)
-      # ------------------------------------------------------------------
+      # 3. إصلاح KittyMemory
       - name: 3) Fix KittyMemory
         shell: bash
         run: |
           cd "$PROJECT_ROOT"
           mkdir -p deps
 
-          echo "🔍 Searching for KittyInclude.hpp..."
+          # البحث عن الهيدر في الملفات المفكوكة
           KITTY_FILE=$(find ../.. -name "KittyInclude.hpp" | head -n 1)
 
           if [ -n "$KITTY_FILE" ]; then
-            echo "✅ Found at: $KITTY_FILE"
-            # نأخذ المجلد الذي يحتوي على الملف
+            echo "✅ Found KittyInclude at: $KITTY_FILE"
             KITTY_DIR=$(dirname "$KITTY_FILE")
             
-            # ننقل محتويات المجلد إلى deps/KittyMemory
+            # حالة خاصة: إذا كان الملف داخل مجلد فرعي اسمه KittyMemory
+            if [[ $(basename "$KITTY_DIR") == "KittyMemory" ]]; then
+               # ننسخ المجلد الأب للحفاظ على الهيكلية
+               CP_SOURCE="$KITTY_DIR"
+            else
+               CP_SOURCE="$KITTY_DIR"
+            fi
+            
             rm -rf deps/KittyMemory
             mkdir -p deps/KittyMemory
-            cp -R "$KITTY_DIR/" deps/KittyMemory/
+            cp -R "$CP_SOURCE/" deps/KittyMemory/
             
-            # حفظ المسار للمترجم
             echo "KITTY_PATH=$PROJECT_ROOT/deps/KittyMemory" >> $GITHUB_ENV
           else
             echo "⚠️ Not found, cloning from git..."
@@ -81,33 +78,34 @@ jobs:
             echo "KITTY_PATH=$PROJECT_ROOT/deps/KittyMemory" >> $GITHUB_ENV
           fi
 
-      # ------------------------------------------------------------------
-      # 4. إصلاح مشكلة UEDumper.mm (تعديل Makefile تلقائياً)
-      # ------------------------------------------------------------------
-      - name: 4) Fix Makefile Source (UEDumper.mm error)
+      # 4. إصلاح Makefile (تم تصحيح أمر sed للماك)
+      - name: 4) Fix Makefile Source
         shell: bash
         run: |
           cd "$PROJECT_ROOT"
           
-          # التحقق هل الملف UEDumper.mm مفقود؟
+          # إذا كان Makefile يطلب UEDumper.mm وهو غير موجود
           if grep -q "UEDumper.mm" Makefile && [ ! -f "UEDumper.mm" ]; then
             echo "⚠️ UEDumper.mm referenced but missing!"
             
-            # البحث عن البديل (Tweak.mm أو Tweak.xm)
-            ALT_FILE=$(find . -maxdepth 2 -name "Tweak.mm" -o -name "Tweak.xm" | head -n 1 | sed 's|^\./||')
+            # البحث عن الملف البديل (Tweak.mm أو src/Tweak.mm)
+            ALT_FILE=$(find . -name "Tweak.mm" -o -name "Tweak.xm" | head -n 1 | sed 's|^\./||')
             
             if [ -n "$ALT_FILE" ]; then
               echo "🔧 Patching Makefile: Replacing UEDumper.mm with $ALT_FILE"
-              sed -i "s/UEDumper.mm/$ALT_FILE/g" Makefile
+              
+              # --- التصحيح هنا: استخدام -i '' للتوافق مع macOS ---
+              sed -i '' "s|UEDumper.mm|$ALT_FILE|g" Makefile
+              
+              echo "✅ Makefile patched successfully."
+              grep "_FILES" Makefile
             else
-              echo "❌ Critical: No source file (Tweak.mm/xm) found!"
+              echo "❌ Critical: No source file found!"
               exit 1
             fi
           fi
 
-      # ------------------------------------------------------------------
-      # 5. تنصيب Theos (مع حل مشكلة SDK already exists)
-      # ------------------------------------------------------------------
+      # 5. تنصيب Theos (مع تنظيف SDK)
       - name: 5) Setup Theos Clean
         shell: bash
         run: |
@@ -117,18 +115,14 @@ jobs:
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "$HOME/theos/bin" >> $GITHUB_PATH
 
-          # 🔥 الحل الجذري لخطأ SDK (Exit 128)
+          # حذف SDKs المسبقة لتجنب الخطأ
           rm -rf $HOME/theos/sdks
           git clone --depth=1 https://github.com/theos/sdks.git $HOME/theos/sdks
-          
-          # حذف النسخ القديمة لتسريع العمل
           rm -rf $HOME/theos/sdks/iPhoneOS{9..13}.sdk
           
           brew install ldid xz
 
-      # ------------------------------------------------------------------
-      # 6. البناء النهائي
-      # ------------------------------------------------------------------
+      # 6. البناء
       - name: 6) Build Package
         shell: bash
         run: |
@@ -137,7 +131,7 @@ jobs:
           echo "🚀 Building..."
           make clean || true
           
-          # تمرير المسارات الإضافية لحل مشكلة 'file not found'
+          # إضافة مسارات التضمين لحل مشكلة 'file not found'
           make package FINALPACKAGE=1 messages=yes \
             THEOS_PACKAGE_SCHEME=rootless \
             ADDITIONAL_CFLAGS="-I$KITTY_PATH -I$PROJECT_ROOT/deps" \
