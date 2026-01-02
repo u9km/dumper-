@@ -2,8 +2,8 @@ name: Build All Zips (Force Run)
 
 on:
   push:
-    branches: [ "main", "master" ] # سيعمل هذا الكود فوراً عند الحفظ
-  workflow_dispatch:
+    branches: [ "main", "master" ] # سيعمل هذا الكود فوراً عند أي تعديل
+  workflow_dispatch: # يضيف زر لتشغيل الأكشن يدوياً
 
 jobs:
   build:
@@ -19,7 +19,8 @@ jobs:
       - name: Unzip ALL Files
         run: |
           echo "Finding and unzipping all zip files..."
-          # يفك ضغط كل الملفات (Tweak, deps, scripts, main)
+          # يفك ضغط كل الملفات (Tweak, deps, scripts, main) الموجودة في المستودع
+          # علامة -o تعني الموافقة على استبدال الملفات لدمج المجلدات
           for file in *.zip; do
             if [ -f "$file" ]; then
               echo "Unzipping $file..."
@@ -27,14 +28,14 @@ jobs:
             fi
           done
 
-      - name: Locate Makefile
+      - name: Locate Project Root
         id: locate
         run: |
-          # يبحث عن Makefile في أي مكان
+          # يبحث عن Makefile في أي مكان لتحديد مجلد المشروع
           MAKEFILE_PATH=$(find . -name "Makefile" -not -path "*/theos/*" | head -n 1)
           
           if [ -z "$MAKEFILE_PATH" ]; then
-            echo "::error::Makefile not found! Check your zip files."
+            echo "::error::Makefile not found! Check if Tweak.zip or Main.zip contains the code."
             exit 1
           fi
           
@@ -42,9 +43,10 @@ jobs:
           echo "Project root found at: $PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
 
-      - name: Fix Dependencies (Smart Move)
+      - name: Fix Dependencies (Smart Merge)
         run: |
           # ينقل مجلد deps إلى داخل مجلد المشروع إذا كانا منفصلين
+          # هذا يحل مشكلة رفع deps.zip بشكل منفصل
           if [ -d "deps" ] && [ "${{ env.PROJECT_ROOT }}" != "." ]; then
              echo "Moving deps folder to project root..."
              cp -r deps "${{ env.PROJECT_ROOT }}/"
@@ -63,7 +65,7 @@ jobs:
         run: |
           cd ${{ env.PROJECT_ROOT }}
           make clean || true
-          # بناء النسخة النهائية
+          # بناء النسخة النهائية بدون جلبريك
           make package FINALPACKAGE=1 messages=yes
 
       - name: Upload DEB Artifact
