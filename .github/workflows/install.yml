@@ -1,190 +1,76 @@
-name: Build From Zips (Auto Extract + Auto Paths + Fix Kitty + Fix fmt)
+name: Build From Zips (Correct Root Detection)
 
 on:
   push:
-    branches: [ "**" ]
+    branches: ["**"]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
-    defaults:
-      run:
-        shell: bash
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
 
-      - name: 1) Unzip ALL zip files (recursive) + show full paths
+      - name: 1) Extract ALL zip files
+        shell: bash
         run: |
-          set -euo pipefail
+          set -e
+          mkdir extracted
 
-          echo "🔎 Searching for zip files (recursive)..."
-          ZIP_LIST="$(find . -type f -name '*.zip' -print | sort || true)"
+          echo "📦 Extracting ZIP files..."
+          for z in *.zip; do
+            echo "➡️ $z"
+            unzip -o -q "$z" -d extracted/
+          done
 
-          if [[ -z "${ZIP_LIST}" ]]; then
-            echo "❌ No zip files found in repository."
-            echo "💡 Put your zips in repo root or any folder, and push again."
+          echo "📂 Extracted tree:"
+          find extracted -maxdepth 4 -type d
+
+      - name: 2) Locate REAL project root (Makefile)
+        shell: bash
+        run: |
+          set -e
+
+          MAKEFILE_PATH=$(find extracted -name Makefile | head -n 1)
+
+          if [ -z "$MAKEFILE_PATH" ]; then
+            echo "❌ Makefile not found in extracted zips"
             exit 1
           fi
 
-          echo "✅ Found these ZIPs:"
-          echo "${ZIP_LIST}"
+          PROJECT_ROOT=$(dirname "$MAKEFILE_PATH")
+          echo "✅ PROJECT_ROOT=$PROJECT_ROOT"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
 
-          echo "📦 Extracting all ZIPs into: $GITHUB_WORKSPACE/_extract"
-          mkdir -p "$GITHUB_WORKSPACE/_extract"
+          echo "📁 Project root contents:"
+          ls -la "$PROJECT_ROOT"
 
-          # unzip كل zip داخل مجلد خاص به (لتجنب تداخل الملفات)
-          while IFS= read -r z; do
-            [[ -f "$z" ]] || continue
-            base="$(basename "$z" .zip)"
-            out="$GITHUB_WORKSPACE/_extract/$base"
-            mkdir -p "$out"
-            echo "➡️ Unzipping: $z  -->  $out"
-            unzip -o -q "$z" -d "$out"
-          done <<< "${ZIP_LIST}"
-
-          echo "🧾 Showing extracted tree (top 300 lines):"
-          (cd "$GITHUB_WORKSPACE/_extract" && find . -print | sed -n '1,300p')
-
-          echo "📌 Full path base: $GITHUB_WORKSPACE/_extract"
-
-      - name: 2) Locate Project Root (Makefile) + detect Kitty + detect fmt + export paths
+      - name: 3) Setup Theos (clean)
+        shell: bash
         run: |
-          set -euo pipefail
+          rm -rf $HOME/theos
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          git clone https://github.com/theos/sdks.git $HOME/theos/sdks
 
-          echo "🔍 Locating Makefile inside extracted content..."
-          MAKEFILE_PATH="$(find "$GITHUB_WORKSPACE/_extract" -type f -name 'Makefile' | head -n 1 || true)"
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
 
-          if [[ -z "${MAKEFILE_PATH}" ]]; then
-            echo "❌ ERROR: Makefile not found inside extracted zips."
-            echo "💡 Ensure one of your ZIPs contains the Theos project with a Makefile."
-            exit 1
-          fi
+          brew install ldid xz fmt || true
 
-          PROJECT_ROOT="$(dirname "$MAKEFILE_PATH")"
-          echo "✅ PROJECT_ROOT = $PROJECT_ROOT"
-          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-
-          echo ""
-          echo "🔍 Searching for KittyInclude.hpp..."
-          KITTY_HDR="$(find "$GITHUB_WORKSPACE/_extract" -type f -name 'KittyInclude.hpp' | head -n 1 || true)"
-          if [[ -n "${KITTY_HDR}" ]]; then
-            KITTY_INC_DIR="$(dirname "$KITTY_HDR")"
-            echo "✅ Found KittyInclude.hpp at: $KITTY_HDR"
-            echo "✅ KITTY_INC_DIR = $KITTY_INC_DIR"
-            echo "KITTY_INC_DIR=$KITTY_INC_DIR" >> "$GITHUB_ENV"
-          else
-            echo "⚠️ KittyInclude.hpp NOT found in zips."
-            echo "KITTY_INC_DIR=" >> "$GITHUB_ENV"
-          fi
-
-          echo ""
-          echo "🔍 Searching for fmt/format.h..."
-          FMT_HDR="$(find "$GITHUB_WORKSPACE/_extract" -type f -path '*/fmt/format.h' | head -n 1 || true)"
-          if [[ -n "${FMT_HDR}" ]]; then
-            # include path لازم يكون قبل fmt/
-            FMT_INC_DIR="$(dirname "$(dirname "$FMT_HDR")")"
-            echo "✅ Found fmt/format.h at: $FMT_HDR"
-            echo "✅ FMT_INC_DIR = $FMT_INC_DIR"
-            echo "FMT_INC_DIR=$FMT_INC_DIR" >> "$GITHUB_ENV"
-          else
-            echo "⚠️ fmt/format.h NOT found in zips (will install via brew)."
-            echo "FMT_INC_DIR=" >> "$GITHUB_ENV"
-          fi
-
-          echo ""
-          echo "🧾 Quick scan important files (first 200 matches):"
-          find "$PROJECT_ROOT" -maxdepth 5 -type f \( -name "*.xm" -o -name "*.mm" -o -name "*.m" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.h" -o -name "Makefile" \) \
-            -print | sed -n '1,200p'
-
-      - name: 3) Setup Theos (clean) + fix sdks conflict + install deps (ldid/xz/fmt)
+      - name: 4) Build from correct directory
+        shell: bash
         run: |
-          set -euo pipefail
-
-          echo "🧹 Cleaning old theos to avoid 'already exists'..."
-          rm -rf "$HOME/theos"
-
-          echo "⬇️ Cloning Theos..."
-          git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
-
-          echo "⬇️ Cloning Theos SDKs..."
-          rm -rf "$HOME/theos/sdks"
-          git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
-
-          echo "✅ THEOS ready at $HOME/theos"
-          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
-          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
-
-          echo "🍺 Installing build tools..."
-          brew update
-          brew install ldid xz
-
-          # fmt: اذا ما لقيناها داخل zips نثبتها
-          if [[ -z "${FMT_INC_DIR:-}" ]]; then
-            echo "🍺 Installing fmt via brew..."
-            brew install fmt
-            FMT_BREW_PREFIX="$(brew --prefix fmt)"
-            echo "✅ fmt prefix: $FMT_BREW_PREFIX"
-            echo "FMT_BREW_PREFIX=$FMT_BREW_PREFIX" >> "$GITHUB_ENV"
-          fi
-
-      - name: 4) Build (force include paths for Kitty + fmt) + package
-        run: |
-          set -euo pipefail
           cd "$PROJECT_ROOT"
 
-          echo "📍 Building in: $PWD"
-          echo "THEOS=$THEOS"
+          echo "🚀 Building from:"
+          pwd
 
-          # ==== Kitty include flags ====
-          KITTY_FLAGS=""
-          if [[ -n "${KITTY_INC_DIR:-}" ]]; then
-            # أحيانًا يحتاج parent أيضًا
-            KITTY_PARENT="$(dirname "$KITTY_INC_DIR")"
-            KITTY_FLAGS="-I${KITTY_INC_DIR} -I${KITTY_PARENT}"
-            echo "✅ Using Kitty flags: $KITTY_FLAGS"
-          else
-            echo "⚠️ Kitty not found in zips. (If your code includes <KittyInclude.hpp>, build may fail.)"
-          fi
-
-          # ==== fmt include flags ====
-          FMT_FLAGS=""
-          if [[ -n "${FMT_INC_DIR:-}" ]]; then
-            FMT_FLAGS="-I${FMT_INC_DIR}"
-            echo "✅ Using fmt from zips: $FMT_FLAGS"
-          else
-            # fmt from brew
-            FMT_FLAGS="-I${FMT_BREW_PREFIX}/include"
-            echo "✅ Using fmt from brew: $FMT_FLAGS"
-          fi
-
-          # نجمع كل الـ flags
-          ALL_INC_FLAGS="$KITTY_FLAGS $FMT_FLAGS"
-
-          echo "🔧 Applying include flags to build..."
-          export CFLAGS="${CFLAGS:-} $ALL_INC_FLAGS"
-          export CXXFLAGS="${CXXFLAGS:-} $ALL_INC_FLAGS"
-          export THEOS_INCLUDE_PATH="$PWD"
-
-          echo "🧹 make clean..."
           make clean || true
-
-          echo "🚀 make package..."
-          make package FINALPACKAGE=1 messages=yes \
-            THEOS_PACKAGE_SCHEME=rootless \
-            ADDITIONAL_CFLAGS="$ALL_INC_FLAGS" \
-            ADDITIONAL_CCFLAGS="$ALL_INC_FLAGS"
-
-          echo "✅ Build finished. Showing packages:"
-          ls -la "$PROJECT_ROOT"/packages || true
+          make package FINALPACKAGE=1 messages=yes
 
       - name: 5) Upload DEB
         uses: actions/upload-artifact@v4
         with:
-          name: Build_DEB
+          name: UEDumper_DEB
           path: ${{ env.PROJECT_ROOT }}/packages/*.deb
