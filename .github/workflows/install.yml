@@ -1,4 +1,4 @@
-name: Build From 4 Zips (Auto-Find Everything)
+name: Build From Zips (Deep Scan + Fix Includes)
 
 on:
   push:
@@ -15,186 +15,181 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 1) Unzip ALL zip files (recursive) + show paths
+      - name: 1) Unzip ALL zip files (deep/recursive) + show paths
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "📦 Searching for zip files..."
           mkdir -p _extract
+          echo "📦 Searching for zip files in repo..."
+          find . -type f -name "*.zip" -print
 
-          # بدون mapfile (لأن macOS bash قديم)
-          found_any=0
-          while IFS= read -r zip; do
-            found_any=1
-            echo "➡️ Unzipping: $zip"
-            # نفك داخل _extract ونسمح بالدمج والاستبدال
-            unzip -o -q "$zip" -d _extract
-          done < <(find . -type f -name "*.zip" -maxdepth 2 -print)
+          echo "📦 Extracting all top-level zips into _extract/ ..."
+          while IFS= read -r z; do
+            echo "==> unzip: $z"
+            unzip -o -q "$z" -d _extract
+          done < <(find . -type f -name "*.zip" -print)
 
-          if [[ "$found_any" -eq 0 ]]; then
-            echo "❌ No zip files found in repo root."
-            exit 1
-          fi
+          # استخراج أي zip داخل الملفات المستخرجة (nested zips) بشكل تكراري
+          echo "🔁 Checking for nested zips inside _extract/ ..."
+          pass=0
+          while true; do
+            nested_count="$(find _extract -type f -name "*.zip" | wc -l | tr -d ' ')"
+            if [ "$nested_count" = "0" ]; then
+              break
+            fi
+            pass=$((pass+1))
+            echo "🔁 Pass #$pass: found $nested_count nested zip(s). Extracting..."
+            while IFS= read -r nz; do
+              echo "   ==> unzip nested: $nz"
+              nz_dir="$(dirname "$nz")"
+              unzip -o -q "$nz" -d "$nz_dir"
+              rm -f "$nz"
+            done < <(find _extract -type f -name "*.zip" -print)
+          done
 
-          echo "✅ Extract done."
-          echo "📂 Top extracted folders:"
-          ls -la _extract || true
+          echo "✅ Extraction done."
+          echo "📂 Top tree (depth 5):"
+          find _extract -maxdepth 5 -print
 
-          echo "🔎 Quick scan (first 200 entries):"
-          (cd _extract && find . -maxdepth 5 -print | head -n 200) || true
-
-      - name: 2) Locate Project Root (Makefile) + locate deps paths (KittyMemory & fmt)
+      - name: 2) Locate Project Root (Makefile) + locate deps (KittyMemory/fmt) + export paths
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "🔍 Finding Makefile (project root)..."
-          MAKEFILE_PATH="$(find _extract -type f -name "Makefile" | head -n 1 || true)"
-          if [[ -z "${MAKEFILE_PATH}" ]]; then
-            echo "❌ ERROR: Makefile not found inside extracted content."
-            echo "🧪 Listing Makefile-like:"
-            find _extract -maxdepth 6 -iname "*makefile*" -print | head -n 50 || true
+          echo "🔎 Searching for Makefile inside _extract/ ..."
+          MAKEFILE_PATH="$(find _extract -type f -name Makefile -not -path "*/theos/*" | head -n 1 || true)"
+          if [ -z "${MAKEFILE_PATH:-}" ]; then
+            echo "❌ ERROR: Makefile not found anywhere inside extracted zips."
+            echo "Tip: تأكد مشروعك فعلاً يحتوي Makefile ضمن الملفات المضغوطة."
             exit 1
           fi
 
           PROJECT_ROOT="$(cd "$(dirname "$MAKEFILE_PATH")" && pwd)"
-          echo "✅ PROJECT_ROOT: $PROJECT_ROOT"
+          echo "✅ PROJECT_ROOT=$PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
 
-          echo "🔍 Finding KittyInclude.hpp (KittyMemory)..."
+          echo "🔎 Searching for KittyInclude.hpp ..."
           KITTY_HEADER="$(find _extract -type f -name "KittyInclude.hpp" | head -n 1 || true)"
-
-          mkdir -p "$PROJECT_ROOT/deps"
-
-          if [[ -n "${KITTY_HEADER}" ]]; then
+          if [ -n "${KITTY_HEADER:-}" ]; then
+            # غالباً المسار يكون .../KittyMemory/KittyInclude.hpp
             KITTY_DIR="$(cd "$(dirname "$KITTY_HEADER")" && pwd)"
-            # إذا الهيدر داخل include/ فالجذر يكون أبوه
-            if [[ "$(basename "$KITTY_DIR")" == "include" ]]; then
-              KITTY_ROOT="$(cd "$KITTY_DIR/.." && pwd)"
-            else
-              KITTY_ROOT="$KITTY_DIR"
-            fi
-
-            echo "✅ Found KittyMemory root: $KITTY_ROOT"
-            echo "KITTY_ROOT=$KITTY_ROOT" >> "$GITHUB_ENV"
+            echo "✅ Found KittyInclude.hpp at: $KITTY_HEADER"
+            echo "✅ Kitty dir: $KITTY_DIR"
           else
-            echo "⚠️ KittyInclude.hpp not found in zips. Will clone fallback."
-            echo "KITTY_ROOT=" >> "$GITHUB_ENV"
+            echo "⚠️ KittyInclude.hpp not found in zips. Will clone KittyMemory."
+            KITTY_DIR=""
           fi
 
-          echo "🔍 Finding fmt/format.h..."
-          FMT_HEADER="$(find _extract -type f -path "*/fmt/format.h" | head -n 1 || true)"
+          # دائماً نثبت المسار النهائي اللي Theos راح يعتمد عليه
+          mkdir -p "$PROJECT_ROOT/deps"
 
-          if [[ -n "${FMT_HEADER}" ]]; then
-            # غالباً يكون داخل include/fmt/format.h
-            FMT_DIR="$(cd "$(dirname "$FMT_HEADER")" && pwd)"         # .../fmt
-            FMT_INCLUDE="$(cd "$FMT_DIR/.." && pwd)"                  # .../include
-            echo "✅ Found fmt include dir: $FMT_INCLUDE"
+          if [ -n "${KITTY_DIR:-}" ]; then
+            # إذا الملف داخل مجلد KittyMemory أو داخل include… نرفع للأب إذا لزم
+            # هدفنا يكون: deps/KittyMemory يحتوي KittyInclude.hpp داخلها أو داخل subfolder واضح
+            echo "📌 Copy KittyMemory into PROJECT_ROOT/deps/KittyMemory"
+            rm -rf "$PROJECT_ROOT/deps/KittyMemory"
+            # إذا KittyInclude.hpp موجود داخل مجلد اسمه KittyMemory ممتاز، غيره انسخ مجلد الملف نفسه
+            base="$(basename "$KITTY_DIR")"
+            if [ "$base" = "KittyMemory" ]; then
+              cp -R "$KITTY_DIR" "$PROJECT_ROOT/deps/KittyMemory"
+            else
+              # انسخ المجلد الحاوي للملف كحل عام
+              cp -R "$KITTY_DIR" "$PROJECT_ROOT/deps/KittyMemory"
+            fi
+          else
+            echo "🌐 Cloning KittyMemory..."
+            rm -rf "$PROJECT_ROOT/deps/KittyMemory"
+            git clone --depth=1 https://github.com/MJx0/KittyMemory.git "$PROJECT_ROOT/deps/KittyMemory"
+          fi
+
+          echo "🔎 Searching for fmt/format.h ..."
+          FMT_HEADER="$(find _extract -type f -path "*/fmt/format.h" | head -n 1 || true)"
+          if [ -n "${FMT_HEADER:-}" ]; then
+            # include path يكون الأب اللي يحتوي مجلد fmt
+            FMT_INCLUDE="$(cd "$(dirname "$(dirname "$FMT_HEADER")")" && pwd)"
+            echo "✅ Found fmt headers in zips at: $FMT_HEADER"
+            echo "✅ FMT_INCLUDE=$FMT_INCLUDE"
             echo "FMT_INCLUDE=$FMT_INCLUDE" >> "$GITHUB_ENV"
           else
-            echo "⚠️ fmt/format.h not found in zips. Will clone fallback."
+            echo "⚠️ fmt headers not found in zips; will install via brew later."
             echo "FMT_INCLUDE=" >> "$GITHUB_ENV"
           fi
 
-      - name: 3) Prepare deps (copy from extracted or clone fallbacks)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${{ env.PROJECT_ROOT }}"
+          echo "📌 Final deps layout:"
+          find "$PROJECT_ROOT/deps" -maxdepth 5 -print || true
 
-          mkdir -p deps
-
-          # KittyMemory
-          if [[ -n "${{ env.KITTY_ROOT }}" ]] && [[ -d "${{ env.KITTY_ROOT }}" ]]; then
-            echo "🚚 Copy KittyMemory into PROJECT_ROOT/deps/KittyMemory"
-            rm -rf deps/KittyMemory
-            cp -R "${{ env.KITTY_ROOT }}" deps/KittyMemory
-          else
-            echo "⬇️ Cloning KittyMemory fallback..."
-            rm -rf deps/KittyMemory
-            git clone --depth=1 https://github.com/MJx0/KittyMemory.git deps/KittyMemory
-          fi
-
-          # fmt
-          if [[ -n "${{ env.FMT_INCLUDE }}" ]] && [[ -d "${{ env.FMT_INCLUDE }}" ]]; then
-            echo "🚚 Copy fmt include into PROJECT_ROOT/deps/fmt/include"
-            rm -rf deps/fmt
-            mkdir -p deps/fmt
-            cp -R "${{ env.FMT_INCLUDE }}" deps/fmt/include
-          else
-            echo "⬇️ Cloning fmt fallback..."
-            rm -rf deps/fmt
-            git clone --depth=1 https://github.com/fmtlib/fmt.git deps/fmt
-            # include سيكون deps/fmt/include
-          fi
-
-          echo "✅ deps ready:"
-          ls -la deps || true
-          echo "✅ KittyMemory check:"
-          find deps/KittyMemory -maxdepth 4 -name "KittyInclude.hpp" -print | head -n 5 || true
-          echo "✅ fmt check:"
-          ls -la deps/fmt/include/fmt/format.h || true
-
-      - name: 4) Setup Theos (clean) + FIX sdks conflict
+      - name: 3) Setup Theos (clean) + FIX sdks conflict + install tools
         shell: bash
         run: |
           set -euo pipefail
 
-          # تنظيف كامل لتجنب مشاكل exists
           rm -rf "$HOME/theos"
-
-          echo "⬇️ Cloning Theos..."
           git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
 
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
           echo "$HOME/theos/bin" >> "$GITHUB_PATH"
 
-          # مهم: احذف sdks قبل clone حتى لا يظهر الخطأ
+          # حل مشكلة sdks already exists
           rm -rf "$HOME/theos/sdks"
-
-          echo "⬇️ Cloning SDKs..."
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
 
-          # تخفيف (اختياري)
-          rm -rf "$HOME/theos/sdks/iPhoneOS"{9..13}.sdk || true
+          # تخفيف الحجم (اختياري)
+          rm -rf "$HOME/theos/sdks/iPhoneOS"{9..13}".sdk" || true
 
           brew update
-          brew install ldid xz || true
+          brew install ldid xz fmt
 
-      - name: 5) Build (auto include paths for KittyMemory + fmt)
+          # احصل include path للـ fmt من brew
+          FMT_PREFIX="$(brew --prefix fmt)"
+          echo "✅ brew fmt prefix: $FMT_PREFIX"
+          echo "BREW_FMT_INCLUDE=$FMT_PREFIX/include" >> "$GITHUB_ENV"
+
+      - name: 4) Build (force include paths for KittyMemory + fmt)
         shell: bash
         run: |
           set -euo pipefail
-          cd "${{ env.PROJECT_ROOT }}"
 
-          # مسارات include الدقيقة
-          KITTY_INC="$PWD/deps/KittyMemory"
-          # إذا KittyMemory فيها include/ نضيفها أيضاً
-          KITTY_INC2="$PWD/deps/KittyMemory/include"
+          cd "$PROJECT_ROOT"
 
-          FMT_INC="$PWD/deps/fmt/include"
+          # مسارات include
+          KITTY_INC_1="$PROJECT_ROOT/deps/KittyMemory"
+          KITTY_INC_2="$PROJECT_ROOT/deps/KittyMemory/include"
+          KITTY_INC_3="$PROJECT_ROOT/deps/KittyMemory/KittyMemory"
 
-          echo "🔧 Using include paths:"
-          echo "  KITTY_INC=$KITTY_INC"
-          echo "  KITTY_INC2=$KITTY_INC2"
-          echo "  FMT_INC=$FMT_INC"
+          # fmt include: يا من zips يا من brew
+          if [ -n "${FMT_INCLUDE:-}" ]; then
+            FMT_INC="$FMT_INCLUDE"
+          else
+            FMT_INC="${BREW_FMT_INCLUDE:-}"
+          fi
 
-          # حقن المسارات (C/C++)
-          export CFLAGS="${CFLAGS:-} -I$KITTY_INC -I$KITTY_INC2 -I$FMT_INC"
-          export CXXFLAGS="${CXXFLAGS:-} -I$KITTY_INC -I$KITTY_INC2 -I$FMT_INC"
-          export THEOS_INCLUDE_PATH="$KITTY_INC:$KITTY_INC2:$FMT_INC"
+          echo "✅ Using include paths:"
+          echo "  - KITTY: $KITTY_INC_1"
+          echo "  - KITTY2: $KITTY_INC_2"
+          echo "  - KITTY3: $KITTY_INC_3"
+          echo "  - FMT:   $FMT_INC"
+
+          # نضيف كل مسارات Kitty المحتملة لأن بعض المشاريع تختلف بترتيب الملفات
+          ADD_INC="-I$KITTY_INC_1 -I$KITTY_INC_2 -I$KITTY_INC_3"
+          if [ -n "${FMT_INC:-}" ]; then
+            ADD_INC="$ADD_INC -I$FMT_INC"
+          fi
 
           make clean || true
 
-          echo "🚀 Building package..."
+          # مهم: نمررها كـ ADDITIONAL_CFLAGS/CCFLAGS عشان توصل للـ clang
           make package FINALPACKAGE=1 messages=yes \
             THEOS_PACKAGE_SCHEME=rootless \
-            ADDITIONAL_CFLAGS="-I$KITTY_INC -I$KITTY_INC2 -I$FMT_INC" \
-            ADDITIONAL_CCFLAGS="-I$KITTY_INC -I$KITTY_INC2 -I$FMT_INC"
+            ADDITIONAL_CFLAGS="$ADD_INC" \
+            ADDITIONAL_CCFLAGS="$ADD_INC" \
+            ADDITIONAL_CXXFLAGS="$ADD_INC"
 
-      - name: 6) Upload DEB
+      - name: 5) Upload DEB
         uses: actions/upload-artifact@v4
         with:
-          name: UEDumper_Final_Build
-          path: ${{ env.PROJECT_ROOT }}/packages/*.deb
+          name: Build_DEB
+          path: |
+            ${{ env.PROJECT_ROOT }}/packages/*.deb
+            ${{ env.PROJECT_ROOT }}/packages/*.ddeb
+          if-no-files-found: error
