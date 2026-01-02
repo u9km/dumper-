@@ -1,121 +1,150 @@
-name: Build From 4 Zips (Ultimate)
+name: Build From All Zips (Auto Locate + Fix)
 
 on:
   push:
-    branches: [ "**" ]
+    branches: ["**"]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 1. Unzip ALL 4 Files
+      - name: 1) Unzip ALL zip files (recursive) + show paths
+        shell: bash
         run: |
-          # فك ضغط كل ملفات Zip الموجودة مهما كان اسمها
-          echo "📦 Unzipping all archives..."
-          for file in *.zip; do
-            if [ -f "$file" ]; then
-              echo "--> Unzipping $file"
-              # -o تعني استبدال الملفات (دمج المجلدات)
-              unzip -o -q "$file"
-            fi
+          set -euo pipefail
+          echo "📦 Searching for zip files..."
+          mapfile -d '' ZIPS < <(find . -type f -name "*.zip" -print0)
+
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "⚠️ No zip files found in repository."
+          else
+            echo "✅ Found ${#ZIPS[@]} zip(s):"
+            printf ' - %s\n' "${ZIPS[@]}"
+          fi
+
+          echo "📂 Unzipping all archives (merge/overwrite)..."
+          for z in "${ZIPS[@]}"; do
+            echo "--> Unzipping: $z"
+            unzip -o -q "$z"
           done
 
-      - name: 2. Locate & Fix Project Structure
+          echo "🔎 After unzip: showing top-level structure"
+          ls -la
+
+      - name: 2) Locate Project Root (Makefile) + locate deps paths
+        shell: bash
         run: |
-          # أين هو ملف Makefile؟ (جذر المشروع)
-          echo "🔍 Searching for Makefile..."
-          MAKEFILE_PATH=$(find . -name "Makefile" -not -path "*/theos/*" | head -n 1)
-          
-          if [ -z "$MAKEFILE_PATH" ]; then
-            echo "❌ ERROR: Makefile not found in any zip!"
+          set -euo pipefail
+
+          echo "🔍 Searching for Makefile (excluding theos if exists)..."
+          MAKEFILE_PATH="$(find . -type f -name "Makefile" -not -path "*/theos/*" | head -n 1 || true)"
+
+          if [ -z "${MAKEFILE_PATH}" ]; then
+            echo "❌ ERROR: Makefile not found after unzipping."
+            echo "Tip: تأكد إن أحد الـ zips يحتوي مشروع Theos tweak وفيه Makefile."
             exit 1
           fi
-          
-          PROJECT_ROOT=$(dirname "$MAKEFILE_PATH")
-          echo "✅ Project Root: $PROJECT_ROOT"
-          echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
-          
-          # أين هو ملف KittyInclude.hpp؟ (جذر المكتبة المفقودة)
-          echo "🔍 Searching for KittyMemory..."
-          KITTY_FILE=$(find . -name "KittyInclude.hpp" | head -n 1)
-          
-          if [ -n "$KITTY_FILE" ]; then
-             # العثور على المجلد الحاوي للملف
-             KITTY_DIR=$(dirname "$KITTY_FILE")
-             
-             # إذا كان المجلد اسمه KittyMemory، نأخذه كما هو
-             # إذا كان الملف داخل مجلد آخر، نحدد المسار الصحيح
-             if [[ $(basename "$KITTY_DIR") == "KittyMemory" ]]; then
-                SOURCE_DIR="$KITTY_DIR"
-             else
-                # حالة نادرة: الملف موجود مباشرة بدون مجلد الأب
-                SOURCE_DIR="$KITTY_DIR"
-             fi
-             
-             echo "✅ Found KittyMemory at: $SOURCE_DIR"
-             
-             # الوجهة المطلوبة: داخل مجلد المشروع في deps/KittyMemory
-             DEST_DIR="$PROJECT_ROOT/deps/KittyMemory"
-             
-             # إنشاء المجلد الوجهة
-             mkdir -p "$PROJECT_ROOT/deps"
-             
-             # نقل الملفات إذا لم تكن في مكانها الصحيح
-             if [ "$(readlink -f "$SOURCE_DIR")" != "$(readlink -f "$DEST_DIR")" ]; then
-                echo "🚚 Moving KittyMemory to $DEST_DIR"
-                rm -rf "$DEST_DIR"
-                cp -r "$SOURCE_DIR" "$DEST_DIR"
-             fi
+
+          PROJECT_ROOT="$(cd "$(dirname "$MAKEFILE_PATH")" && pwd)"
+          echo "✅ PROJECT_ROOT=$PROJECT_ROOT"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+          echo "🔍 Searching for KittyInclude.hpp (KittyMemory)..."
+          KITTY_FILE="$(find . -type f -name "KittyInclude.hpp" | head -n 1 || true)"
+          if [ -n "${KITTY_FILE}" ]; then
+            KITTY_DIR="$(cd "$(dirname "$KITTY_FILE")" && pwd)"
+            echo "✅ Found KittyMemory header at: $KITTY_FILE"
+            echo "✅ Using source dir: $KITTY_DIR"
+
+            mkdir -p "$PROJECT_ROOT/deps"
+            DEST_DIR="$PROJECT_ROOT/deps/KittyMemory"
+
+            # لو هي بالفعل في نفس المكان لا تنسخ
+            if [ "$KITTY_DIR" != "$DEST_DIR" ]; then
+              echo "🚚 Copying KittyMemory to: $DEST_DIR"
+              rm -rf "$DEST_DIR"
+              mkdir -p "$DEST_DIR"
+              cp -R "$KITTY_DIR"/. "$DEST_DIR"/
+            else
+              echo "ℹ️ KittyMemory already in correct place."
+            fi
           else
-             echo "⚠️ KittyMemory not found! Cloning fallback..."
-             mkdir -p "$PROJECT_ROOT/deps"
-             git clone https://github.com/MJx0/KittyMemory.git "$PROJECT_ROOT/deps/KittyMemory"
+            echo "⚠️ KittyMemory not found in extracted files. Cloning fallback..."
+            mkdir -p "$PROJECT_ROOT/deps"
+            git clone --depth=1 https://github.com/MJx0/KittyMemory.git "$PROJECT_ROOT/deps/KittyMemory"
           fi
 
-      - name: 3. Setup Theos (Reset & Install)
-        run: |
-          # تنظيف أي تثبيت سابق لتجنب خطأ "already exists"
-          rm -rf $HOME/theos
-          
-          # تثبيت جديد ونظيف
-          git clone --recursive --depth=1 https://github.com/theos/theos.git $HOME/theos
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          echo "$HOME/theos/bin" >> $GITHUB_PATH
-          
-          # تحميل SDKs
-          git clone --depth=1 https://github.com/theos/sdks.git $HOME/theos/sdks
-          # حذف SDKs القديمة لتخفيف الحجم
-          rm -rf $HOME/theos/sdks/iPhoneOS{9..13}.sdk
-          
-          brew install ldid xz
+          echo "📌 Quick path check:"
+          echo "PROJECT_ROOT => $PROJECT_ROOT"
+          echo "KittyMemory   => $PROJECT_ROOT/deps/KittyMemory"
+          ls -la "$PROJECT_ROOT" || true
+          ls -la "$PROJECT_ROOT/deps" || true
 
-      - name: 4. Force Build (Include Fix)
+      - name: 3) Setup Theos (clean) + FIX sdks conflict
+        shell: bash
         run: |
-          cd ${{ env.PROJECT_ROOT }}
-          
-          echo "🔧 Patching Build Environment..."
-          # نقوم بإضافة مسار KittyMemory إلى متغيرات البيئة الخاصة بـ Theos إجبارياً
-          # هذا يحل مشكلة file not found 100%
+          set -euo pipefail
+
+          # تنظيف كامل عشان ما تصير تعارضات
+          rm -rf "$HOME/theos"
+
+          echo "⬇️ Cloning Theos..."
+          # IMPORTANT: لا تعمل clone للـ sdks مرة ثانية إذا theos جابها كـ submodule
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
+
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+
+          # تأكد أن sdks موجودة (جاءت مع --recursive غالباً)
+          if [ -d "$HOME/theos/sdks" ] && [ "$(ls -A "$HOME/theos/sdks" | wc -l | tr -d ' ')" -gt 0 ]; then
+            echo "✅ sdks already present via submodule: $HOME/theos/sdks"
+          else
+            echo "⚠️ sdks missing/empty. Cloning sdks..."
+            rm -rf "$HOME/theos/sdks"
+            git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
+          fi
+
+          # تقليل الحجم (اختياري)
+          rm -rf "$HOME/theos/sdks/iPhoneOS"9*.sdk "$HOME/theos/sdks/iPhoneOS1"0*.sdk \
+                 "$HOME/theos/sdks/iPhoneOS1"1*.sdk "$HOME/theos/sdks/iPhoneOS1"2*.sdk \
+                 "$HOME/theos/sdks/iPhoneOS1"3*.sdk || true
+
+          echo "🍺 Installing build deps..."
+          brew update
+          brew install ldid xz || true
+
+      - name: 4) Build (force include paths)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          echo "🔧 Ensuring KittyMemory include path..."
           export THEOS_INCLUDE_PATH="$PWD/deps/KittyMemory"
-          export CFLAGS="$CFLAGS -I$PWD/deps/KittyMemory"
-          export CXXFLAGS="$CXXFLAGS -I$PWD/deps/KittyMemory"
-          
-          echo "🚀 Building..."
+          export CFLAGS="${CFLAGS:-} -I$PWD/deps/KittyMemory"
+          export CXXFLAGS="${CXXFLAGS:-} -I$PWD/deps/KittyMemory"
+
+          echo "🧹 Clean..."
           make clean || true
-          
-          # تمرير المسارات مباشرة لأمر الـ make
+
+          echo "🚀 Build package..."
           make package FINALPACKAGE=1 messages=yes \
             THEOS_PACKAGE_SCHEME=rootless \
             ADDITIONAL_CFLAGS="-I$PWD/deps/KittyMemory" \
             ADDITIONAL_CCFLAGS="-I$PWD/deps/KittyMemory"
 
-      - name: 5. Upload DEB
+          echo "📦 Built packages:"
+          ls -la "$PROJECT_ROOT/packages" || true
+
+      - name: 5) Upload DEB
         uses: actions/upload-artifact@v4
         with:
-          name: UEDumper_Final_Build
+          name: Build_DEB
           path: ${{ env.PROJECT_ROOT }}/packages/*.deb
+          if-no-files-found: error
