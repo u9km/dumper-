@@ -1,4 +1,4 @@
-name: Build From Zips (Auto-Discover + Fix Paths)
+name: Build From 4 Zips (Auto Scan + Fix)
 
 on:
   push:
@@ -15,174 +15,237 @@ jobs:
         with:
           fetch-depth: 0
 
+      # 1) Unzip all zip files recursively (NO mapfile; works on bash 3.2)
       - name: 1) Unzip ALL zip files (recursive) + show paths
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "🔎 Searching for zip files (recursive)..."
+          echo "🔎 Searching for .zip files anywhere..."
+          # find all zips in repo (including nested) and unzip into a single workspace folder
+          rm -rf _extract
           mkdir -p _extract
 
-          # ابحث عن كل zip داخل الريبو (حتى لو داخل مجلد)
-          find . -type f -name "*.zip" -print0 | while IFS= read -r -d '' z; do
-            echo "📦 Unzipping: $z"
-            unzip -o -q "$z" -d _extract
+          # unzip each zip into a subfolder named after the zip (safe, no collisions)
+          find . -type f -name "*.zip" -print | while IFS= read -r z; do
+            base="$(basename "$z" .zip)"
+            out="_extract/$base"
+            echo "📦 Unzipping: $z  -->  $out"
+            mkdir -p "$out"
+            unzip -o -q "$z" -d "$out"
           done
 
-          echo "✅ Done unzipping."
-          echo "📂 Top of _extract:"
+          echo ""
+          echo "✅ Extracted roots:"
           ls -la _extract || true
 
-          echo "🧾 Show some extracted structure (depth 4):"
-          find _extract -maxdepth 4 -type d -print | sed 's|^| - |' | head -n 200
+          echo ""
+          echo "🧭 Listing top-level structure (2 levels) to prove everything exists:"
+          find _extract -maxdepth 2 -type d -print | sed 's|^|DIR: |'
 
+          echo ""
+          echo "📄 Showing key files (Makefile / *.mm / *.xm / KittyInclude.hpp / fmt headers):"
+          find _extract -type f \( -name "Makefile" -o -name "*.mm" -o -name "*.xm" -o -name "KittyInclude.hpp" -o -path "*fmt/format.h" \) -print | sed 's|^|FILE: |' || true
+
+      # 2) Locate project root by Makefile (Theos project)
       - name: 2) Locate PROJECT_ROOT (Makefile) + locate deps (KittyMemory) + locate sources
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "🔍 Searching for Makefile inside _extract..."
+          echo "🔍 Searching for Makefile in extracted content..."
           MAKEFILE_PATH="$(find _extract -type f -name "Makefile" | head -n 1 || true)"
-
-          if [[ -z "${MAKEFILE_PATH}" ]]; then
-            echo "❌ ERROR: Makefile not found in extracted content."
-            echo "   Show Makefile candidates:"
-            find _extract -type f -iname "*makefile*" -maxdepth 8 -print || true
+          if [ -z "${MAKEFILE_PATH:-}" ]; then
+            echo "❌ ERROR: No Makefile found inside extracted zips."
             exit 1
           fi
 
-          PROJECT_ROOT="$(dirname "$MAKEFILE_PATH")"
-          echo "✅ PROJECT_ROOT=$PROJECT_ROOT"
+          PROJECT_ROOT="$(cd "$(dirname "$MAKEFILE_PATH")" && pwd)"
+          echo "✅ PROJECT_ROOT = $PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
 
           echo ""
-          echo "🔍 Searching for KittyInclude.hpp inside _extract..."
-          KITTY_HEADER="$(find _extract -type f -name "KittyInclude.hpp" | head -n 1 || true)"
-
-          if [[ -n "${KITTY_HEADER}" ]]; then
-            KITTY_INC_DIR="$(dirname "$KITTY_HEADER")"
-            KITTY_BASE_DIR="$(cd "$KITTY_INC_DIR/.." && pwd 2>/dev/null || true)"
-            echo "✅ Found KittyInclude.hpp at: $KITTY_HEADER"
-            echo "✅ KITTY_INC_DIR=$KITTY_INC_DIR"
-            echo "✅ KITTY_BASE_DIR=$KITTY_BASE_DIR"
+          echo "🔍 Searching for KittyInclude.hpp..."
+          KITTY_HDR="$(find _extract -type f -name "KittyInclude.hpp" | head -n 1 || true)"
+          if [ -n "${KITTY_HDR:-}" ]; then
+            echo "✅ Found KittyInclude.hpp at: $KITTY_HDR"
+            KITTY_INC_DIR="$(cd "$(dirname "$KITTY_HDR")" && pwd)"
+            echo "✅ KITTY_INC_DIR = $KITTY_INC_DIR"
             echo "KITTY_INC_DIR=$KITTY_INC_DIR" >> "$GITHUB_ENV"
-            echo "KITTY_BASE_DIR=$KITTY_BASE_DIR" >> "$GITHUB_ENV"
           else
-            echo "⚠️ KittyInclude.hpp not found in zips. Will clone KittyMemory as fallback."
+            echo "⚠️ KittyInclude.hpp not found in zips."
             echo "KITTY_INC_DIR=" >> "$GITHUB_ENV"
-            echo "KITTY_BASE_DIR=" >> "$GITHUB_ENV"
           fi
 
           echo ""
-          echo "🔎 Quick sanity: show PROJECT_ROOT files:"
-          ls -la "$PROJECT_ROOT" || true
+          echo "🔍 Searching for tweak sources (*.xm / *.mm / *.m) in PROJECT_ROOT..."
+          find "$PROJECT_ROOT" -type f \( -name "*.xm" -o -name "*.mm" -o -name "*.m" \) -print | sed 's|^|SRC: |' || true
 
-          echo ""
-          echo "🔎 Find .mm/.xm/.m sources near PROJECT_ROOT (for Tweak.mm issue):"
-          find "$PROJECT_ROOT" -maxdepth 4 -type f \( -name "*.mm" -o -name "*.xm" -o -name "*.m" -o -name "*.cpp" -o -name "*.hpp" -o -name "*.h" \) | head -n 120 || true
-
+      # 3) Setup Theos (clean) + FIX sdks conflict + install deps (fmt, ldid, xz)
       - name: 3) Setup Theos (clean) + FIX sdks conflict
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "🧹 Cleaning previous theos..."
+          echo "🧹 Removing old Theos to avoid conflicts..."
           rm -rf "$HOME/theos"
 
-          echo "⬇️ Cloning theos..."
+          echo "⬇️ Cloning Theos..."
           git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
 
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
           echo "$HOME/theos/bin" >> "$GITHUB_PATH"
 
-          echo "🧹 Remove any existing sdks to avoid 'already exists'..."
+          echo "⬇️ Installing SDKs (clean, no 'already exists' error)..."
           rm -rf "$HOME/theos/sdks"
-
-          echo "⬇️ Cloning sdks..."
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
 
-          echo "🧹 Optional: remove old sdks to reduce size"
-          rm -rf "$HOME/theos/sdks/iPhoneOS9.0.sdk" || true
-          rm -rf "$HOME/theos/sdks/iPhoneOS10.0.sdk" || true
-          rm -rf "$HOME/theos/sdks/iPhoneOS11.0.sdk" || true
-          rm -rf "$HOME/theos/sdks/iPhoneOS12.0.sdk" || true
-          rm -rf "$HOME/theos/sdks/iPhoneOS13.0.sdk" || true
+          echo "🧽 Optional: remove very old SDKs to reduce size..."
+          rm -rf "$HOME/theos/sdks/iPhoneOS"{9,10,11,12,13}.sdk || true
 
-          echo "🍺 Installing build tools..."
+          echo "🍺 Installing build tools + fmt..."
           brew update
-          brew install ldid xz make fmt
+          brew install ldid xz fmt
 
-          echo "✅ Theos installed at: $HOME/theos"
-          ls -la "$HOME/theos" | head -n 30 || true
-          echo "✅ SDKs:"
-          ls -la "$HOME/theos/sdks" | head -n 50 || true
+          echo "✅ Theos + deps ready."
 
+      # 3.1) Ensure KittyMemory exists (fallback clone) and place it in PROJECT_ROOT/deps/KittyMemory
       - name: 3.1) Ensure KittyMemory exists (fallback clone)
         shell: bash
         run: |
           set -euo pipefail
+          cd "$PROJECT_ROOT"
 
-          cd "${{ env.PROJECT_ROOT }}"
+          mkdir -p deps
 
-          if [[ -z "${{ env.KITTY_INC_DIR }}" ]]; then
+          if [ -n "${KITTY_INC_DIR:-}" ]; then
+            echo "📦 Using KittyMemory from extracted zips..."
+            # We want deps/KittyMemory to contain KittyInclude.hpp somewhere inside.
+            rm -rf deps/KittyMemory
+            mkdir -p deps/KittyMemory
+            # copy the parent folder of include dir to keep structure
+            # if KITTY_INC_DIR ends with /KittyMemory then copy it, else copy that folder content
+            parent="$(basename "$KITTY_INC_DIR")"
+            if [ "$parent" = "KittyMemory" ]; then
+              cp -R "$KITTY_INC_DIR" deps/KittyMemory
+            else
+              cp -R "$KITTY_INC_DIR" deps/KittyMemory/
+            fi
+          else
             echo "⬇️ Cloning KittyMemory fallback into PROJECT_ROOT/deps/KittyMemory ..."
-            mkdir -p deps
             rm -rf deps/KittyMemory
             git clone --depth=1 https://github.com/MJx0/KittyMemory.git deps/KittyMemory
-
-            # Try to locate KittyInclude.hpp again
-            KITTY_HEADER="$(find deps/KittyMemory -type f -name "KittyInclude.hpp" | head -n 1 || true)"
-            if [[ -z "$KITTY_HEADER" ]]; then
-              echo "❌ ERROR: KittyInclude.hpp still not found after clone."
-              exit 1
-            fi
-
-            KITTY_INC_DIR="$(dirname "$KITTY_HEADER")"
-            KITTY_BASE_DIR="$(cd "$KITTY_INC_DIR/.." && pwd 2>/dev/null || true)"
-
-            echo "✅ Found KittyInclude.hpp at: $KITTY_HEADER"
-            echo "✅ KITTY_INC_DIR=$KITTY_INC_DIR"
-            echo "✅ KITTY_BASE_DIR=$KITTY_BASE_DIR"
-
-            echo "KITTY_INC_DIR=$KITTY_INC_DIR" >> "$GITHUB_ENV"
-            echo "KITTY_BASE_DIR=$KITTY_BASE_DIR" >> "$GITHUB_ENV"
-          else
-            echo "✅ KittyMemory already found from zips."
           fi
 
+          echo "🔎 Verifying KittyInclude.hpp..."
+          FOUND_KITTY="$(find deps/KittyMemory -type f -name "KittyInclude.hpp" | head -n 1 || true)"
+          if [ -z "${FOUND_KITTY:-}" ]; then
+            echo "❌ ERROR: KittyInclude.hpp still not found in deps/KittyMemory"
+            echo "📂 Listing deps/KittyMemory:"
+            find deps/KittyMemory -maxdepth 4 -type d -print
+            exit 1
+          fi
+
+          echo "✅ Found KittyInclude.hpp at: $FOUND_KITTY"
+          KITTY_INC_LOCAL="$(cd "$(dirname "$FOUND_KITTY")" && pwd)"
+          echo "KITTY_INC_LOCAL=$KITTY_INC_LOCAL" >> "$GITHUB_ENV"
+
+      # 3.2) Auto-fix Makefile if it references a missing source file (e.g. UEDumper.mm not present)
+      - name: 3.2) Auto-fix Makefile (missing source file like UEDumper.mm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          echo "🧩 Checking Makefile for missing *_FILES entries..."
+          if [ ! -f Makefile ]; then
+            echo "❌ ERROR: Makefile not found in PROJECT_ROOT"
+            exit 1
+          fi
+
+          echo "🔎 Candidate sources in project:"
+          find . -maxdepth 3 -type f \( -name "*.xm" -o -name "*.mm" -o -name "*.m" \) -print | sed 's|^|CAND: |' || true
+
+          # pick a "main" source file if exists
+          MAIN_SRC="$(find . -maxdepth 3 -type f \( -name "*.xm" -o -name "*.mm" \) | head -n 1 || true)"
+          if [ -z "${MAIN_SRC:-}" ]; then
+            MAIN_SRC="$(find . -maxdepth 3 -type f -name "*.m" | head -n 1 || true)"
+          fi
+          if [ -z "${MAIN_SRC:-}" ]; then
+            echo "❌ ERROR: No source files (*.xm/*.mm/*.m) found to build."
+            exit 1
+          fi
+          # normalize to relative path without leading ./
+          MAIN_SRC="${MAIN_SRC#./}"
+          echo "✅ Selected MAIN_SRC = $MAIN_SRC"
+
+          # If Makefile contains a *_FILES line referencing a non-existing file, replace that token with MAIN_SRC.
+          # This fixes: "Error: File UEDumper.mm does not exist."
+          # We'll scan all tokens that end with .mm/.xm/.m and replace only those that don't exist.
+          FILE_TOKENS="$(grep -E '^[A-Za-z0-9_]+\_FILES\s*\+?=' Makefile | sed 's/.*=\s*//' | tr ' ' '\n' | grep -E '\.(mm|xm|m)$' || true)"
+
+          if [ -n "${FILE_TOKENS:-}" ]; then
+            echo "$FILE_TOKENS" | while IFS= read -r tok; do
+              # strip possible trailing backslashes
+              t="${tok%\\}"
+              if [ ! -f "$t" ]; then
+                echo "🛠 Missing in Makefile: $t  -> replacing with $MAIN_SRC"
+                # replace exact token occurrences
+                perl -0777 -i -pe "s/\b\Q$t\E\b/$MAIN_SRC/g" Makefile
+              else
+                echo "✅ Exists: $t"
+              fi
+            done
+          else
+            echo "ℹ️ No *_FILES tokens detected (or Makefile format differs). Skipping token patch."
+          fi
+
+          echo ""
+          echo "📄 Final Makefile *_FILES lines:"
+          grep -nE '^[A-Za-z0-9_]+\_FILES' Makefile || true
+
+      # 4) Build with auto include paths for KittyMemory + fmt
       - name: 4) Build (auto include paths for KittyMemory + fmt)
         shell: bash
         run: |
           set -euo pipefail
-          cd "${{ env.PROJECT_ROOT }}"
+          cd "$PROJECT_ROOT"
 
-          echo "🧠 Using PROJECT_ROOT: $PWD"
-          echo "📌 KITTY_INC_DIR: ${{ env.KITTY_INC_DIR }}"
-          echo "📌 KITTY_BASE_DIR: ${{ env.KITTY_BASE_DIR }}"
-
-          # fmt paths
-          FMT_PREFIX="$(brew --prefix fmt)"
-          echo "📌 FMT_PREFIX: $FMT_PREFIX"
-
-          # Includes:
-          # - Kitty include dir (where KittyInclude.hpp exists)
-          # - Kitty base dir (sometimes headers are referenced relative)
-          # - fmt include
-          INC_FLAGS=""
-          if [[ -n "${{ env.KITTY_INC_DIR }}" ]]; then
-            INC_FLAGS="$INC_FLAGS -I${{ env.KITTY_INC_DIR }} -I${{ env.KITTY_BASE_DIR }}"
+          echo "🔧 Detecting Kitty include directory..."
+          # prefer the verified local include path
+          KITTY_INC="${KITTY_INC_LOCAL:-}"
+          if [ -z "${KITTY_INC:-}" ]; then
+            # fallback: find again
+            FOUND_KITTY="$(find deps/KittyMemory -type f -name "KittyInclude.hpp" | head -n 1 || true)"
+            if [ -n "${FOUND_KITTY:-}" ]; then
+              KITTY_INC="$(cd "$(dirname "$FOUND_KITTY")" && pwd)"
+            fi
           fi
-          INC_FLAGS="$INC_FLAGS -I$FMT_PREFIX/include"
 
-          # Link fmt (حل مشكلة ld: symbols not found المتعلقة بـ fmt)
+          if [ -z "${KITTY_INC:-}" ]; then
+            echo "❌ ERROR: Cannot locate Kitty include directory."
+            exit 1
+          fi
+
+          echo "✅ KITTY_INC = $KITTY_INC"
+
+          echo "🔧 Detecting fmt include/lib..."
+          FMT_PREFIX="$(brew --prefix fmt)"
+          echo "✅ FMT_PREFIX = $FMT_PREFIX"
+
+          INC_FLAGS="-I$KITTY_INC -I$FMT_PREFIX/include"
           LIB_FLAGS="-L$FMT_PREFIX/lib -lfmt"
 
-          echo "✅ INC_FLAGS=$INC_FLAGS"
-          echo "✅ LIB_FLAGS=$LIB_FLAGS"
+          echo ""
+          echo "✅ Using include flags: $INC_FLAGS"
+          echo "✅ Using lib flags:     $LIB_FLAGS"
 
+          echo ""
+          echo "🧼 Cleaning..."
           make clean || true
 
-          # نمرر الفلاقز مباشرة
+          echo "🚀 Building package..."
+          # Pass include + link flags in the standard Theos variables
           make package FINALPACKAGE=1 messages=yes \
             THEOS_PACKAGE_SCHEME=rootless \
             ADDITIONAL_CFLAGS="$INC_FLAGS" \
@@ -193,7 +256,6 @@ jobs:
       - name: 5) Upload DEB
         uses: actions/upload-artifact@v4
         with:
-          name: Deb_Output
-          path: |
-            ${{ env.PROJECT_ROOT }}/packages/*.deb
-            ${{ env.PROJECT_ROOT }}/.theos/obj/**/*.log
+          name: UEDumper_Build_DEB
+          path: ${{ env.PROJECT_ROOT }}/packages/*.deb
+          if-no-files-found: error
