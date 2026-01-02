@@ -1,4 +1,4 @@
-name: Build Fixed
+name: Build Fixed V2
 
 on:
   push:
@@ -35,26 +35,36 @@ jobs:
           PROJECT_ROOT=$(dirname "$MAKEFILE_PATH")
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
           
-          # 3. نقل مجلد deps إذا كان منفصلاً (إصلاح مشكلة KittyMemory)
+          # 3. نقل مجلد deps إذا كان منفصلاً
           if [ -d "deps" ] && [ "$PROJECT_ROOT" != "." ] && [ ! -d "$PROJECT_ROOT/deps" ]; then
             echo "Moving deps to project folder..."
             mv deps "$PROJECT_ROOT/"
           fi
 
-      - name: Setup Theos
+      - name: Setup Theos (Fixed)
         run: |
+          # تنصيب Theos
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "$HOME/theos/bin" >> $GITHUB_PATH
+          
+          # --- الإصلاح هنا ---
+          # حذف مجلد sdks الفارغ الذي أنشأه Theos لتجنب الخطأ
+          rm -rf $HOME/theos/sdks
+          
+          # تحميل الـ SDKs الآن
           git clone https://github.com/theos/sdks.git $HOME/theos/sdks
-          rm -rf $HOME/theos/sdks/*.sdk
+          
+          # تنظيف الـ SDKs القديمة لتقليل الحجم
+          rm -rf $HOME/theos/sdks/iPhoneOS{9,10,11,12,13}.sdk
+          
           brew install ldid xz
 
       - name: Build Tweak
         run: |
           cd ${{ env.PROJECT_ROOT }}
           make clean || true
-          # هذا الأمر يبني المشروع بدون جلبريك
+          # بناء المشروع - تجاهل الأخطاء البسيطة
           make package FINALPACKAGE=1 messages=yes
 
       - name: Upload Result
