@@ -1,14 +1,13 @@
-name: Build All Zips (No-Jailbreak)
+name: Build All Zips (Force Run)
 
 on:
   push:
-    paths:
-      - '**/*.zip'
+    branches: [ "main", "master" ] # سيعمل هذا الكود فوراً عند الحفظ
   workflow_dispatch:
 
 jobs:
   build:
-    name: Extract All & Build
+    name: Extract & Build
     runs-on: macos-latest
 
     steps:
@@ -20,24 +19,22 @@ jobs:
       - name: Unzip ALL Files
         run: |
           echo "Finding and unzipping all zip files..."
-          # هذا الأمر يفك ضغط كل الملفات الموجودة دفعة واحدة
-          # الترتيب مهم: سيفك ضغطهم في نفس المكان ليتعرفوا على بعض
+          # يفك ضغط كل الملفات (Tweak, deps, scripts, main)
           for file in *.zip; do
-            echo "Unzipping $file..."
-            unzip -o "$file"
+            if [ -f "$file" ]; then
+              echo "Unzipping $file..."
+              unzip -o "$file"
+            fi
           done
-          
-          echo "Files in directory after unzip:"
-          ls -R | grep ":$" | head -n 10 # طباعة للتأكد من الملفات
 
       - name: Locate Makefile
         id: locate
         run: |
-          # البحث عن ملف Makefile في أي مكان (سواء داخل مجلد Tweak أو في الجذر)
+          # يبحث عن Makefile في أي مكان
           MAKEFILE_PATH=$(find . -name "Makefile" -not -path "*/theos/*" | head -n 1)
           
           if [ -z "$MAKEFILE_PATH" ]; then
-            echo "::error::Makefile not found! Make sure one of your zips contains the source code."
+            echo "::error::Makefile not found! Check your zip files."
             exit 1
           fi
           
@@ -45,10 +42,9 @@ jobs:
           echo "Project root found at: $PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
 
-      - name: Fix Dependencies (Merge deps)
+      - name: Fix Dependencies (Smart Move)
         run: |
-          # هذه الخطوة ذكية: إذا كان مجلد deps مفصولاً، سنحاول وضعه في المكان الصحيح
-          # إذا وجدنا مجلد deps في الجذر، ومجلد المشروع في مكان آخر، ننقل deps للمشروع
+          # ينقل مجلد deps إلى داخل مجلد المشروع إذا كانا منفصلين
           if [ -d "deps" ] && [ "${{ env.PROJECT_ROOT }}" != "." ]; then
              echo "Moving deps folder to project root..."
              cp -r deps "${{ env.PROJECT_ROOT }}/"
@@ -66,8 +62,8 @@ jobs:
       - name: Build Package
         run: |
           cd ${{ env.PROJECT_ROOT }}
-          # تنظيف وبناء
-          make clean
+          make clean || true
+          # بناء النسخة النهائية
           make package FINALPACKAGE=1 messages=yes
 
       - name: Upload DEB Artifact
