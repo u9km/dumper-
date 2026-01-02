@@ -1,4 +1,4 @@
-name: Build From Zips (Correct Root Detection)
+name: Build From 4 Zips (Auto-Find Everything)
 
 on:
   push:
@@ -8,69 +8,193 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 1) Extract ALL zip files
+      - name: 1) Unzip ALL zip files (recursive) + show paths
         shell: bash
         run: |
-          set -e
-          mkdir extracted
+          set -euo pipefail
 
-          echo "📦 Extracting ZIP files..."
-          for z in *.zip; do
-            echo "➡️ $z"
-            unzip -o -q "$z" -d extracted/
-          done
+          echo "📦 Searching for zip files..."
+          mkdir -p _extract
 
-          echo "📂 Extracted tree:"
-          find extracted -maxdepth 4 -type d
+          # بدون mapfile (لأن macOS bash قديم)
+          found_any=0
+          while IFS= read -r zip; do
+            found_any=1
+            echo "➡️ Unzipping: $zip"
+            # نفك داخل _extract ونسمح بالدمج والاستبدال
+            unzip -o -q "$zip" -d _extract
+          done < <(find . -type f -name "*.zip" -maxdepth 2 -print)
 
-      - name: 2) Locate REAL project root (Makefile)
-        shell: bash
-        run: |
-          set -e
-
-          MAKEFILE_PATH=$(find extracted -name Makefile | head -n 1)
-
-          if [ -z "$MAKEFILE_PATH" ]; then
-            echo "❌ Makefile not found in extracted zips"
+          if [[ "$found_any" -eq 0 ]]; then
+            echo "❌ No zip files found in repo root."
             exit 1
           fi
 
-          PROJECT_ROOT=$(dirname "$MAKEFILE_PATH")
-          echo "✅ PROJECT_ROOT=$PROJECT_ROOT"
-          echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
+          echo "✅ Extract done."
+          echo "📂 Top extracted folders:"
+          ls -la _extract || true
 
-          echo "📁 Project root contents:"
-          ls -la "$PROJECT_ROOT"
+          echo "🔎 Quick scan (first 200 entries):"
+          (cd _extract && find . -maxdepth 5 -print | head -n 200) || true
 
-      - name: 3) Setup Theos (clean)
+      - name: 2) Locate Project Root (Makefile) + locate deps paths (KittyMemory & fmt)
         shell: bash
         run: |
-          rm -rf $HOME/theos
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
-          git clone https://github.com/theos/sdks.git $HOME/theos/sdks
+          set -euo pipefail
 
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          echo "$HOME/theos/bin" >> $GITHUB_PATH
+          echo "🔍 Finding Makefile (project root)..."
+          MAKEFILE_PATH="$(find _extract -type f -name "Makefile" | head -n 1 || true)"
+          if [[ -z "${MAKEFILE_PATH}" ]]; then
+            echo "❌ ERROR: Makefile not found inside extracted content."
+            echo "🧪 Listing Makefile-like:"
+            find _extract -maxdepth 6 -iname "*makefile*" -print | head -n 50 || true
+            exit 1
+          fi
 
-          brew install ldid xz fmt || true
+          PROJECT_ROOT="$(cd "$(dirname "$MAKEFILE_PATH")" && pwd)"
+          echo "✅ PROJECT_ROOT: $PROJECT_ROOT"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
 
-      - name: 4) Build from correct directory
+          echo "🔍 Finding KittyInclude.hpp (KittyMemory)..."
+          KITTY_HEADER="$(find _extract -type f -name "KittyInclude.hpp" | head -n 1 || true)"
+
+          mkdir -p "$PROJECT_ROOT/deps"
+
+          if [[ -n "${KITTY_HEADER}" ]]; then
+            KITTY_DIR="$(cd "$(dirname "$KITTY_HEADER")" && pwd)"
+            # إذا الهيدر داخل include/ فالجذر يكون أبوه
+            if [[ "$(basename "$KITTY_DIR")" == "include" ]]; then
+              KITTY_ROOT="$(cd "$KITTY_DIR/.." && pwd)"
+            else
+              KITTY_ROOT="$KITTY_DIR"
+            fi
+
+            echo "✅ Found KittyMemory root: $KITTY_ROOT"
+            echo "KITTY_ROOT=$KITTY_ROOT" >> "$GITHUB_ENV"
+          else
+            echo "⚠️ KittyInclude.hpp not found in zips. Will clone fallback."
+            echo "KITTY_ROOT=" >> "$GITHUB_ENV"
+          fi
+
+          echo "🔍 Finding fmt/format.h..."
+          FMT_HEADER="$(find _extract -type f -path "*/fmt/format.h" | head -n 1 || true)"
+
+          if [[ -n "${FMT_HEADER}" ]]; then
+            # غالباً يكون داخل include/fmt/format.h
+            FMT_DIR="$(cd "$(dirname "$FMT_HEADER")" && pwd)"         # .../fmt
+            FMT_INCLUDE="$(cd "$FMT_DIR/.." && pwd)"                  # .../include
+            echo "✅ Found fmt include dir: $FMT_INCLUDE"
+            echo "FMT_INCLUDE=$FMT_INCLUDE" >> "$GITHUB_ENV"
+          else
+            echo "⚠️ fmt/format.h not found in zips. Will clone fallback."
+            echo "FMT_INCLUDE=" >> "$GITHUB_ENV"
+          fi
+
+      - name: 3) Prepare deps (copy from extracted or clone fallbacks)
         shell: bash
         run: |
-          cd "$PROJECT_ROOT"
+          set -euo pipefail
+          cd "${{ env.PROJECT_ROOT }}"
 
-          echo "🚀 Building from:"
-          pwd
+          mkdir -p deps
+
+          # KittyMemory
+          if [[ -n "${{ env.KITTY_ROOT }}" ]] && [[ -d "${{ env.KITTY_ROOT }}" ]]; then
+            echo "🚚 Copy KittyMemory into PROJECT_ROOT/deps/KittyMemory"
+            rm -rf deps/KittyMemory
+            cp -R "${{ env.KITTY_ROOT }}" deps/KittyMemory
+          else
+            echo "⬇️ Cloning KittyMemory fallback..."
+            rm -rf deps/KittyMemory
+            git clone --depth=1 https://github.com/MJx0/KittyMemory.git deps/KittyMemory
+          fi
+
+          # fmt
+          if [[ -n "${{ env.FMT_INCLUDE }}" ]] && [[ -d "${{ env.FMT_INCLUDE }}" ]]; then
+            echo "🚚 Copy fmt include into PROJECT_ROOT/deps/fmt/include"
+            rm -rf deps/fmt
+            mkdir -p deps/fmt
+            cp -R "${{ env.FMT_INCLUDE }}" deps/fmt/include
+          else
+            echo "⬇️ Cloning fmt fallback..."
+            rm -rf deps/fmt
+            git clone --depth=1 https://github.com/fmtlib/fmt.git deps/fmt
+            # include سيكون deps/fmt/include
+          fi
+
+          echo "✅ deps ready:"
+          ls -la deps || true
+          echo "✅ KittyMemory check:"
+          find deps/KittyMemory -maxdepth 4 -name "KittyInclude.hpp" -print | head -n 5 || true
+          echo "✅ fmt check:"
+          ls -la deps/fmt/include/fmt/format.h || true
+
+      - name: 4) Setup Theos (clean) + FIX sdks conflict
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # تنظيف كامل لتجنب مشاكل exists
+          rm -rf "$HOME/theos"
+
+          echo "⬇️ Cloning Theos..."
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
+
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+
+          # مهم: احذف sdks قبل clone حتى لا يظهر الخطأ
+          rm -rf "$HOME/theos/sdks"
+
+          echo "⬇️ Cloning SDKs..."
+          git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
+
+          # تخفيف (اختياري)
+          rm -rf "$HOME/theos/sdks/iPhoneOS"{9..13}.sdk || true
+
+          brew update
+          brew install ldid xz || true
+
+      - name: 5) Build (auto include paths for KittyMemory + fmt)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${{ env.PROJECT_ROOT }}"
+
+          # مسارات include الدقيقة
+          KITTY_INC="$PWD/deps/KittyMemory"
+          # إذا KittyMemory فيها include/ نضيفها أيضاً
+          KITTY_INC2="$PWD/deps/KittyMemory/include"
+
+          FMT_INC="$PWD/deps/fmt/include"
+
+          echo "🔧 Using include paths:"
+          echo "  KITTY_INC=$KITTY_INC"
+          echo "  KITTY_INC2=$KITTY_INC2"
+          echo "  FMT_INC=$FMT_INC"
+
+          # حقن المسارات (C/C++)
+          export CFLAGS="${CFLAGS:-} -I$KITTY_INC -I$KITTY_INC2 -I$FMT_INC"
+          export CXXFLAGS="${CXXFLAGS:-} -I$KITTY_INC -I$KITTY_INC2 -I$FMT_INC"
+          export THEOS_INCLUDE_PATH="$KITTY_INC:$KITTY_INC2:$FMT_INC"
 
           make clean || true
-          make package FINALPACKAGE=1 messages=yes
 
-      - name: 5) Upload DEB
+          echo "🚀 Building package..."
+          make package FINALPACKAGE=1 messages=yes \
+            THEOS_PACKAGE_SCHEME=rootless \
+            ADDITIONAL_CFLAGS="-I$KITTY_INC -I$KITTY_INC2 -I$FMT_INC" \
+            ADDITIONAL_CCFLAGS="-I$KITTY_INC -I$KITTY_INC2 -I$FMT_INC"
+
+      - name: 6) Upload DEB
         uses: actions/upload-artifact@v4
         with:
-          name: UEDumper_DEB
+          name: UEDumper_Final_Build
           path: ${{ env.PROJECT_ROOT }}/packages/*.deb
